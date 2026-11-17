@@ -49,6 +49,8 @@ export interface IssueRec {
   createdAt: string;
   updatedAt: string;
   comments: CommentRec[];
+  /** Memoized REST body for GET-one-issue (app.ts), keyed by a fingerprint of every field it reads. */
+  restCache?: { key: string; buf: Buffer };
 }
 
 export interface PullRec {

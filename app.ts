@@ -36,13 +36,24 @@ function requestId(): string {
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  const buf = Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'x-github-request-id': requestId(),
-    ...(text !== '' ? { 'content-length': Buffer.byteLength(text) } : {}),
+    ...(text !== '' ? { 'content-length': buf.length } : {}),
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
+}
+
+/** Send an already-serialized JSON body (the memoized GET-one-issue path) with sendJson's headers. */
+function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'x-github-request-id': requestId(),
+    'content-length': buf.length,
+  });
+  res.end(buf);
 }
 
 function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
@@ -198,6 +209,25 @@ function issueJson(forge: Forge, repo: RepoRec, issue: IssueRec): Record<string,
   };
 }
 
+/**
+ * The serialized GET-one-issue body, memoized on the issue record. The fingerprint covers every
+ * value issueJson reads — the issue's own fields, its comment count, the label records behind its
+ * label names, and the repo's owner/name in its URLs — so a hit is byte-identical to a fresh
+ * serialization, and any mutation anywhere in that set changes the fingerprint.
+ */
+function issueJsonBuffer(forge: Forge, repo: RepoRec, issue: IssueRec): Buffer {
+  const labelPart = issue.labels.map((name) => {
+    const label = repo.labels.get(name);
+    return label === undefined ? name : `${name}:${label.id}:${label.color}:${label.description ?? ''}`;
+  }).join(',');
+  const key = `${repo.owner}/${repo.name}|${issue.authorLogin}|${issue.title}|${issue.body ?? ''}|${issue.state}|${issue.createdAt}|${issue.updatedAt}|${issue.comments.length}|${labelPart}`;
+  const cached = issue.restCache;
+  if (cached !== undefined && cached.key === key) return cached.buf;
+  const buf = Buffer.from(`${JSON.stringify(issueJson(forge, repo, issue))}\n`, 'utf8');
+  issue.restCache = { key, buf };
+  return buf;
+}
+
 function pullSideJson(forge: Forge, repo: RepoRec, ref: string): Record<string, unknown> {
   const tip = repo.refs.get(`refs/heads/${ref}`) ?? ZERO_OID;
   return {
@@ -330,7 +360,7 @@ function pageSlice<T>(items: readonly T[], url: URL, req?: IncomingMessage): { p
 async function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const method = req.method ?? 'GET';
   const path = url.pathname.replace(/\/+$/, '') || '/api/v3';
-  const segments = path.split('/').filter((s) => s !== '').map((s) => decodeURIComponent(s));
+  const segments = path.split('/').filter((s) => s !== '').map((s) => (s.includes('%') ? decodeURIComponent(s) : s));
   // segments[0] = 'api', segments[1] = 'v3'
   const rest = segments.slice(2);
 
@@ -1071,7 +1101,7 @@ async function handleIssues(forge: Forge, req: IncomingMessage, res: ServerRespo
       }
       if (method === 'GET') {
         if (issue !== undefined) {
-          sendJson(res, 200, issueJson(forge, repo, issue));
+          sendJsonBuffer(res, 200, issueJsonBuffer(forge, repo, issue));
         } else {
           const asIssue = pullJson(forge, repo, pull!);
           asIssue.pull_request = { url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull!.number}`, html_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull!.number}` };
@@ -1666,8 +1696,9 @@ function validateAndApplyPush(repo: RepoRec, command: PushCommand): string | nul
     return null;
   }
   if (ref.startsWith('refs/heads/')) {
-    if (peelToCommit(repo.store, newOid) === null) return 'not a commit';
-    if (current !== ZERO_OID && !isAncestor(repo.store, current, peelToCommit(repo.store, newOid)!)) {
+    const targetCommit = peelToCommit(repo.store, newOid);
+    if (targetCommit === null) return 'not a commit';
+    if (current !== ZERO_OID && !isAncestor(repo.store, current, targetCommit)) {
       return 'non-fast-forward';
     }
     repo.refs.set(ref, newOid);

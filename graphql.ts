@@ -316,8 +316,17 @@ function resolveValue(value: GqlValue, variables: Variables): unknown {
   return value;
 }
 
+const nodeIdCache = new Map<string, string>();
+
 export function nodeId(type: string, dbId: number): string {
-  return Buffer.from(`${type}:${dbId}`, 'utf8').toString('base64');
+  const key = `${type}:${dbId}`;
+  let hit = nodeIdCache.get(key);
+  if (hit === undefined) {
+    hit = Buffer.from(key, 'utf8').toString('base64');
+    if (nodeIdCache.size > 10_000) nodeIdCache.clear();
+    nodeIdCache.set(key, hit);
+  }
+  return hit;
 }
 
 export function decodeNodeId(id: string): { type: string; dbId: number } | null {

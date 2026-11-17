@@ -50,12 +50,69 @@ export class ObjectStore {
 // Pack reading
 // -------------------------------------------------------------------------------------------------
 
+/** Adler-32 of `data` (the checksum every zlib stream ends with), as one unsigned 32-bit number. */
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  const NMAX = 5552; // longest run before the sums are reduced (the classic zlib bound)
+  let a = 1;
+  let b = 0;
+  let i = 0;
+  while (i < data.length) {
+    const end = Math.min(i + NMAX, data.length);
+    for (; i < end; i += 1) {
+      a += data[i]!;
+      b += a;
+    }
+    a %= MOD;
+    b %= MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+const PACK_TYPE_CODES: ReadonlySet<number> = new Set([1, 2, 3, 4, 6, 7]);
+
 /**
  * Inflate one zlib stream whose inflated size is known, starting the scan at `offset`. Returns the
- * inflated bytes and the offset just past the stream. Node's sync inflate ignores trailing bytes,
- * so the exact end is found by bisecting for the shortest prefix that still inflates completely.
+ * inflated bytes and the offset just past the stream.
+ *
+ * Fast path: Node's sync inflate stops at the stream's end and ignores trailing bytes, so one call
+ * on the rest of the pack inflates exactly this entry. The stream's last four bytes are the
+ * Adler-32 of the inflated bytes, so scanning for that trailer locates the entry's end; a
+ * candidate end is accepted only when what follows is the pack trailer (the final entry) or a
+ * plausible next entry header. parsePackEntries additionally verifies the whole pack (entry count
+ * consumed exactly, trailer SHA-1) and re-parses with the probing path when anything is off, so a
+ * false trailer match can never slip through.
  */
 function inflateEntry(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; next: number } {
+  try {
+    const data = inflateSync(buf.subarray(offset));
+    if (data.length === expectedSize) {
+      const adler = adler32(data);
+      const needle = Buffer.from([(adler >>> 24) & 0xff, (adler >>> 16) & 0xff, (adler >>> 8) & 0xff, adler & 0xff]);
+      // The trailer sits at least 2 header bytes + 1 deflate byte into the stream.
+      let from = offset + 3;
+      while (from < buf.length) {
+        const idx = buf.indexOf(needle, from);
+        if (idx === -1) break;
+        const next = idx + 4;
+        if (next === buf.length - 20) return { data, next };
+        const head = buf[next];
+        if (head !== undefined && PACK_TYPE_CODES.has((head >> 4) & 0x7)) return { data, next };
+        from = idx + 1;
+      }
+    }
+  } catch {
+    // Corrupt stream: the probing path below raises the proper error.
+  }
+  return inflateEntryProbed(buf, offset, expectedSize);
+}
+
+/**
+ * The original probing inflate: Node's sync inflate ignores trailing bytes, so the exact end is
+ * found by bisecting for the shortest prefix that still inflates completely. Kept as the fallback
+ * for packs the fast path cannot place, and as the error source for corrupt streams.
+ */
+function inflateEntryProbed(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; next: number } {
   let lo = offset; // known too short (or the start)
   let hi = Math.min(buf.length, offset + Math.max(64, expectedSize * 2 + 64));
   let data: Buffer | null = null;
@@ -102,7 +159,13 @@ interface PackEntry {
   entryOffset: number;
 }
 
-function parsePackEntries(pack: Buffer): PackEntry[] {
+type InflateFn = (buf: Buffer, offset: number, expectedSize: number) => { data: Buffer; next: number };
+
+/**
+ * Parse a pack's entries with the given entry inflate, returning the entries and the offset just
+ * past the last one (where the 20-byte trailer sits in a well-formed pack).
+ */
+function parsePackEntriesPass(pack: Buffer, inflate: InflateFn): { entries: PackEntry[]; endOffset: number } {
   if (pack.length < 12 + 20 || pack.subarray(0, 4).toString('latin1') !== 'PACK') {
     throw new Error('not a pack file');
   }
@@ -135,22 +198,44 @@ function parsePackEntries(pack: Buffer): PackEntry[] {
         offset += 1;
         back = ((back + 1) << 7) | (b & 0x7f);
       }
-      const { data, next } = inflateEntry(pack, offset, size);
+      const { data, next } = inflate(pack, offset, size);
       offset = next;
       entries.push({ type, data, baseOffset: entryOffset - back, entryOffset });
     } else if (type === 'ref-delta') {
       const baseOid = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
-      const { data, next } = inflateEntry(pack, offset, size);
+      const { data, next } = inflate(pack, offset, size);
       offset = next;
       entries.push({ type, data, baseOid, entryOffset });
     } else {
-      const { data, next } = inflateEntry(pack, offset, size);
+      const { data, next } = inflate(pack, offset, size);
       offset = next;
       entries.push({ type, data, entryOffset });
     }
   }
-  return entries;
+  return { entries, endOffset: offset };
+}
+
+/**
+ * Parse a pack's entries. The fast inflate's boundaries are verified against the pack as a
+ * whole — the entries must end exactly where the trailer begins and the trailer must be the
+ * SHA-1 of everything before it — and any doubt re-parses with the probing inflate, whose
+ * boundaries are exact by construction (and which throws for genuinely corrupt packs).
+ */
+function parsePackEntries(pack: Buffer): PackEntry[] {
+  let fast: { entries: PackEntry[]; endOffset: number } | null = null;
+  try {
+    fast = parsePackEntriesPass(pack, inflateEntry);
+  } catch {
+    fast = null;
+  }
+  if (fast !== null) {
+    const trailerStart = pack.length - 20;
+    const verified = fast.endOffset === trailerStart
+      && sha1Hex(pack.subarray(0, trailerStart)) === pack.subarray(trailerStart).toString('hex');
+    if (verified) return fast.entries;
+  }
+  return parsePackEntriesPass(pack, inflateEntryProbed).entries;
 }
 
 /** Apply a git delta buffer to a base object. */
@@ -210,6 +295,18 @@ export function ingestPack(store: ObjectStore, pack: Buffer): number {
   const entries = parsePackEntries(pack);
   const byOffset = new Map<number, PackEntry>();
   for (const entry of entries) byOffset.set(entry.entryOffset, entry);
+  // Non-delta entries by oid, for ref-delta bases inside the pack; built lazily on first use so
+  // packs without ref-deltas never pay for the hashing.
+  let byOid: Map<string, PackEntry> | null = null;
+  const findInPack = (oid: string): PackEntry | undefined => {
+    if (byOid === null) {
+      byOid = new Map();
+      for (const entry of entries) {
+        if (entry.type !== 'ofs-delta' && entry.type !== 'ref-delta') byOid.set(objectId(entry.type, entry.data), entry);
+      }
+    }
+    return byOid.get(oid);
+  };
   const resolved = new Map<number, { type: GitObjectType; data: Buffer; oid: string }>();
 
   const resolve = (entry: PackEntry, depth: number): { type: GitObjectType; data: Buffer; oid: string } => {
@@ -225,7 +322,7 @@ export function ingestPack(store: ObjectStore, pack: Buffer): number {
         base = resolve(baseEntry, depth + 1);
       } else {
         const baseOid = entry.baseOid!;
-        const inPack = entries.find((e) => e.type !== 'ofs-delta' && e.type !== 'ref-delta' && objectId(e.type, e.data) === baseOid);
+        const inPack = findInPack(baseOid);
         if (inPack !== undefined) {
           base = resolve(inPack, depth + 1);
         } else {
