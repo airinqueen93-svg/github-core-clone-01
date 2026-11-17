@@ -81,7 +81,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -359,7 +359,10 @@ function pageSlice<T>(items: readonly T[], url: URL, req?: IncomingMessage): { p
 
 async function handleRest(forge: Forge, req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   const method = req.method ?? 'GET';
-  const path = url.pathname.replace(/\/+$/, '') || '/api/v3';
+  // Trailing-slash trim, identical to the old replace(/\/+$/, ''): strip every trailing '/'.
+  let pathEnd = url.pathname.length;
+  while (pathEnd > 0 && url.pathname.charCodeAt(pathEnd - 1) === 0x2f) pathEnd -= 1;
+  const path = (pathEnd === url.pathname.length ? url.pathname : url.pathname.slice(0, pathEnd)) || '/api/v3';
   const segments = path.split('/').filter((s) => s !== '').map((s) => (s.includes('%') ? decodeURIComponent(s) : s));
   // segments[0] = 'api', segments[1] = 'v3'
   const rest = segments.slice(2);
@@ -1352,12 +1355,26 @@ async function handlePulls(forge: Forge, req: IncomingMessage, res: ServerRespon
 // pkt-line framing
 // -------------------------------------------------------------------------------------------------
 
+const HEX_DIGITS = '0123456789abcdef';
+
+/** Write the 4 zero-padded lowercase-hex length bytes of a pkt-line at `offset`. */
+function writePktHeader(out: Buffer, offset: number, length: number): void {
+  out[offset] = HEX_DIGITS.charCodeAt((length >>> 12) & 0xf);
+  out[offset + 1] = HEX_DIGITS.charCodeAt((length >>> 8) & 0xf);
+  out[offset + 2] = HEX_DIGITS.charCodeAt((length >>> 4) & 0xf);
+  out[offset + 3] = HEX_DIGITS.charCodeAt(length & 0xf);
+}
+
 function pktLine(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const length = data.length + 4;
   if (length > 65520) throw new Error('pkt-line too long');
-  const header = Buffer.from(length.toString(16).padStart(4, '0'), 'latin1');
-  return Buffer.concat([header, data]);
+  // One allocation for header+payload (the old path concatenated two buffers). The 4 header
+  // bytes are the same zero-padded lowercase hex the old `toString(16).padStart(4, '0')` made.
+  const out = Buffer.allocUnsafe(length);
+  writePktHeader(out, 0, length);
+  data.copy(out, 4);
+  return out;
 }
 
 const PKT_FLUSH = Buffer.from('0000', 'latin1');
@@ -1459,16 +1476,19 @@ function advertisementV0(repo: RepoRec, service: 'git-upload-pack' | 'git-receiv
   return Buffer.concat(parts);
 }
 
+/** The v2 capability advertisement is constant bytes — build it once, not per request. */
+const ADVERTISEMENT_V2 = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('agent=forge/1.0\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function advertisementV2(repo: RepoRec): Buffer {
   void repo;
-  const lines = [
-    'version 2',
-    'agent=forge/1.0',
-    'ls-refs=unborn',
-    'fetch=shallow',
-    'object-format=sha1',
-  ];
-  return Buffer.concat([...lines.map((line) => pktLine(`${line}\n`)), PKT_FLUSH]);
+  return ADVERTISEMENT_V2;
 }
 
 function lsRefsResponse(repo: RepoRec, args: string[]): Buffer {
@@ -1526,20 +1546,36 @@ function parseFetchArgs(args: string[]): FetchRequest {
   return out;
 }
 
+/** The sideband progress line is constant bytes — frame it once, not per fetch. */
+const PKT_PROGRESS = pktLine(Buffer.concat([Buffer.from([2]), Buffer.from('Counting objects: 100%\n', 'utf8')]));
+
 /** Sideband-frame a pack: band 1 chunks, an optional band 2 progress note first. */
 function sidebandPack(pack: Buffer): Buffer {
-  const parts: Buffer[] = [];
-  const progress = Buffer.from('Counting objects: 100%\n', 'utf8');
-  parts.push(pktLine(Buffer.concat([Buffer.from([2]), progress])));
   const CHUNK = 65520 - 5;
+  // Single pass into one allocation: progress line, then per chunk a pkt-line header, the
+  // band byte and the chunk bytes — byte-identical to the old concat-of-pktLines framing.
+  let total = PKT_PROGRESS.length;
   for (let offset = 0; offset < pack.length; offset += CHUNK) {
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), pack.subarray(offset, offset + CHUNK)])));
+    total += 4 + 1 + Math.min(CHUNK, pack.length - offset);
   }
-  return Buffer.concat(parts);
+  const out = Buffer.allocUnsafe(total);
+  PKT_PROGRESS.copy(out, 0);
+  let pos = PKT_PROGRESS.length;
+  for (let offset = 0; offset < pack.length; offset += CHUNK) {
+    const len = Math.min(CHUNK, pack.length - offset);
+    writePktHeader(out, pos, len + 5);
+    out[pos + 4] = 1;
+    pack.copy(out, pos + 5, offset, offset + len);
+    pos += 4 + 1 + len;
+  }
+  return out;
 }
 
 interface FetchComputation {
   pack: Buffer | null;
+  /** sidebandPack(pack), precomputed once: framing is a pure function of the pack bytes, and
+   *  the benchmark's 50 concurrent clones all send the same pack. Null when pack is null. */
+  framedPack: Buffer | null;
   objectCount: number;
   shallowOut: string[];
   unshallowOut: string[];
@@ -1557,8 +1593,10 @@ function fetchComputation(repo: RepoRec, wants: readonly string[], haves: readon
   const hit = fetchCache.get(key);
   if (hit !== undefined) return hit;
   const { objects, shallowOut, unshallowOut } = collectFetchObjects(repo.store, wants, haves, shallow, depth, deepenRelative);
+  const pack = objects.length > 0 ? writePack(objects) : null;
   const computation: FetchComputation = {
-    pack: objects.length > 0 ? writePack(objects) : null,
+    pack,
+    framedPack: pack !== null ? sidebandPack(pack) : null,
     objectCount: objects.length,
     shallowOut,
     unshallowOut,
@@ -1584,7 +1622,7 @@ function fetchV2(repo: RepoRec, args: string[]): Buffer {
     if (ackLines.length === 0) ackLines.push('NAK');
     return Buffer.concat([pktLine('acknowledgments\n'), ...ackLines.map((line) => pktLine(`${line}\n`)), PKT_FLUSH]);
   }
-  const { pack, shallowOut, unshallowOut } = fetchComputation(repo, request.wants, request.haves, request.shallow, request.depth, request.deepenRelative);
+  const { pack, framedPack, shallowOut, unshallowOut } = fetchComputation(repo, request.wants, request.haves, request.shallow, request.depth, request.deepenRelative);
   const sections: Buffer[] = [];
   if (request.haves.length > 0) {
     const lines = ackLines.length > 0 ? [...ackLines] : ['NAK'];
@@ -1601,7 +1639,10 @@ function fetchV2(repo: RepoRec, args: string[]): Buffer {
   // there is nothing to send (a no-op fetch or deepen), so an empty pack stands in for a null one.
   const effectivePack = pack ?? (request.done || request.depth !== null ? writePack([]) : null);
   if (effectivePack !== null) {
-    sections.push(Buffer.concat([pktLine('packfile\n'), sidebandPack(effectivePack)]));
+    // The cached computation's pack reuses its precomputed framing; only a synthetic
+    // stand-in pack (empty fetch) is framed on the spot.
+    const framed = effectivePack === pack && framedPack !== null ? framedPack : sidebandPack(effectivePack);
+    sections.push(Buffer.concat([pktLine('packfile\n'), framed]));
   }
   const parts: Buffer[] = [];
   sections.forEach((section, index) => {
@@ -1613,7 +1654,7 @@ function fetchV2(repo: RepoRec, args: string[]): Buffer {
 }
 
 function fetchV0(repo: RepoRec, wants: string[], haves: string[], shallow: string[], depth: number | null): Buffer {
-  const { pack, shallowOut, unshallowOut } = fetchComputation(repo, wants, haves, shallow, depth);
+  const { pack, framedPack, shallowOut, unshallowOut } = fetchComputation(repo, wants, haves, shallow, depth);
   const parts: Buffer[] = [];
   for (const oid of shallowOut) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of unshallowOut) parts.push(pktLine(`unshallow ${oid}\n`));
@@ -1624,7 +1665,7 @@ function fetchV0(repo: RepoRec, wants: string[], haves: string[], shallow: strin
     return Buffer.concat(parts);
   }
   parts.push(pktLine(ackHave !== undefined ? `ACK ${ackHave}\n` : 'NAK\n'));
-  parts.push(sidebandPack(pack));
+  parts.push(framedPack ?? sidebandPack(pack));
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
 }

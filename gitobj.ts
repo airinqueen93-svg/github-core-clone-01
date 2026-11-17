@@ -17,8 +17,10 @@ export function sha1Hex(data: Buffer): string {
 }
 
 export function objectId(type: GitObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Streaming hash of header‖data: SHA-1 is a streaming digest, so update(header).update(data)
+  // hashes exactly the bytes the old Buffer.concat([header, data]) path hashed — same oid, one
+  // less allocation and no copy of `data`.
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'utf8').update(data).digest('hex');
 }
 
 /** One repository's object database: oid -> raw (inflated) object. */

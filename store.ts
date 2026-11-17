@@ -97,6 +97,9 @@ export class Forge {
   private nextLabelId = 3000;
   private nextCommentId = 200000;
   private lastMs = 0;
+  /** Cache for now(): the ISO prefix through the seconds field ('…T HH:mm:ss.') of isoSecond. */
+  private isoSecond = -1;
+  private isoPrefix = '';
 
   constructor() {
     const seed: UserRec[] = [
@@ -112,7 +115,21 @@ export class Forge {
   now(): string {
     const nowMs = Date.now();
     this.lastMs = nowMs > this.lastMs ? nowMs : this.lastMs + 1;
-    return new Date(this.lastMs).toISOString();
+    // Within one second, toISOString's output differs only in the 3 millisecond digits before
+    // the final 'Z' (the fraction is always exactly 3 digits), so reuse the prefix computed
+    // for that second and substitute the digits: byte-identical to a fresh toISOString().
+    const second = Math.floor(this.lastMs / 1000);
+    if (second !== this.isoSecond) {
+      const iso = new Date(this.lastMs).toISOString();
+      this.isoSecond = second;
+      // Only the canonical 24-char layout ('YYYY-MM-DDTHH:mm:ss.sssZ') has its millisecond
+      // digits at a fixed offset; anything else (expanded years) skips the cache entirely.
+      this.isoPrefix = iso.length === 24 ? iso.slice(0, 20) : '';
+      return iso;
+    }
+    if (this.isoPrefix === '') return new Date(this.lastMs).toISOString();
+    const rem = this.lastMs - second * 1000;
+    return `${this.isoPrefix}${rem < 10 ? '00' : rem < 100 ? '0' : ''}${rem}Z`;
   }
 
   nowEpoch(): number {
