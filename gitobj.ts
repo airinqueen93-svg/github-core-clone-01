@@ -85,10 +85,14 @@ const PACK_TYPE_CODES: ReadonlySet<number> = new Set([1, 2, 3, 4, 6, 7]);
  * consumed exactly, trailer SHA-1) and re-parses with the probing path when anything is off, so a
  * false trailer match can never slip through.
  */
-function inflateEntry(buf: Buffer, offset: number, expectedSize: number): { data: Buffer; next: number } {
+function inflateEntry(buf: Buffer, offset: number, expectedSize: number, isLast = false): { data: Buffer; next: number } {
   try {
     const data = inflateSync(buf.subarray(offset));
     if (data.length === expectedSize) {
+      // The pack's final entry ends exactly where the 20-byte trailer begins, so its end
+      // needs no scan. A malformed pack is still caught by parsePackEntries' whole-pack
+      // verification, which re-parses with the probing path on any mismatch.
+      if (isLast) return { data, next: buf.length - 20 };
       const adler = adler32(data);
       const needle = Buffer.from([(adler >>> 24) & 0xff, (adler >>> 16) & 0xff, (adler >>> 8) & 0xff, adler & 0xff]);
       // The trailer sits at least 2 header bytes + 1 deflate byte into the stream.
@@ -161,7 +165,7 @@ interface PackEntry {
   entryOffset: number;
 }
 
-type InflateFn = (buf: Buffer, offset: number, expectedSize: number) => { data: Buffer; next: number };
+type InflateFn = (buf: Buffer, offset: number, expectedSize: number, isLast?: boolean) => { data: Buffer; next: number };
 
 /**
  * Parse a pack's entries with the given entry inflate, returning the entries and the offset just
@@ -200,17 +204,17 @@ function parsePackEntriesPass(pack: Buffer, inflate: InflateFn): { entries: Pack
         offset += 1;
         back = ((back + 1) << 7) | (b & 0x7f);
       }
-      const { data, next } = inflate(pack, offset, size);
+      const { data, next } = inflate(pack, offset, size, i === count - 1);
       offset = next;
       entries.push({ type, data, baseOffset: entryOffset - back, entryOffset });
     } else if (type === 'ref-delta') {
       const baseOid = pack.subarray(offset, offset + 20).toString('hex');
       offset += 20;
-      const { data, next } = inflate(pack, offset, size);
+      const { data, next } = inflate(pack, offset, size, i === count - 1);
       offset = next;
       entries.push({ type, data, baseOid, entryOffset });
     } else {
-      const { data, next } = inflate(pack, offset, size);
+      const { data, next } = inflate(pack, offset, size, i === count - 1);
       offset = next;
       entries.push({ type, data, entryOffset });
     }
@@ -234,7 +238,7 @@ function parsePackEntries(pack: Buffer): PackEntry[] {
   if (fast !== null) {
     const trailerStart = pack.length - 20;
     const verified = fast.endOffset === trailerStart
-      && sha1Hex(pack.subarray(0, trailerStart)) === pack.subarray(trailerStart).toString('hex');
+      && createHash('sha1').update(pack.subarray(0, trailerStart)).digest().equals(pack.subarray(trailerStart));
     if (verified) return fast.entries;
   }
   return parsePackEntriesPass(pack, inflateEntryProbed).entries;
@@ -295,6 +299,14 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
  */
 export function ingestPack(store: ObjectStore, pack: Buffer): number {
   const entries = parsePackEntries(pack);
+  // Packs without deltas (the common case: every push the suite makes) need no resolution
+  // machinery — hash each entry and store it directly.
+  if (!entries.some((entry) => entry.type === 'ofs-delta' || entry.type === 'ref-delta')) {
+    for (const entry of entries) {
+      store.putWithId(objectId(entry.type as GitObjectType, entry.data), entry.type as GitObjectType, entry.data);
+    }
+    return entries.length;
+  }
   const byOffset = new Map<number, PackEntry>();
   for (const entry of entries) byOffset.set(entry.entryOffset, entry);
   // Non-delta entries by oid, for ref-delta bases inside the pack; built lazily on first use so

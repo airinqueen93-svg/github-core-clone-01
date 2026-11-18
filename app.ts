@@ -363,9 +363,20 @@ async function handleRest(forge: Forge, req: IncomingMessage, res: ServerRespons
   let pathEnd = url.pathname.length;
   while (pathEnd > 0 && url.pathname.charCodeAt(pathEnd - 1) === 0x2f) pathEnd -= 1;
   const path = (pathEnd === url.pathname.length ? url.pathname : url.pathname.slice(0, pathEnd)) || '/api/v3';
-  const segments = path.split('/').filter((s) => s !== '').map((s) => (s.includes('%') ? decodeURIComponent(s) : s));
-  // segments[0] = 'api', segments[1] = 'v3'
-  const rest = segments.slice(2);
+  // The old path split the path, dropped empty segments, percent-decoded the rest and
+  // sliced off 'api'/'v3'; this loop produces the same `rest` in one pass with no
+  // intermediate arrays. (The two leading segments are 'api' and 'v3' by the dispatcher's
+  // routing, and carry no '%' to decode.)
+  const rest: string[] = [];
+  {
+    let segmentIndex = 0;
+    for (const part of path.split('/')) {
+      if (part === '') continue;
+      segmentIndex += 1;
+      if (segmentIndex <= 2) continue;
+      rest.push(part.includes('%') ? decodeURIComponent(part) : part);
+    }
+  }
 
   if (rest.length === 0) {
     sendJson(res, 200, {
@@ -1392,9 +1403,21 @@ function readPkts(buf: Buffer, offset: number): PktRead {
   let pos = offset;
   while (pos < buf.length) {
     if (pos + 4 > buf.length) throw new Error('truncated pkt-line header');
-    const header = buf.subarray(pos, pos + 4).toString('latin1');
-    if (!/^[0-9a-f]{4}$/.test(header)) throw new Error(`invalid pkt-line header ${JSON.stringify(header)}`);
-    const length = parseInt(header, 16);
+    // The 4 header bytes are lowercase hex (the old path regex-tested a latin1 string for
+    // exactly [0-9a-f]{4}); read the digits arithmetically and build the string only for
+    // the error message, so valid lines allocate nothing here.
+    let length = 0;
+    let valid = true;
+    for (let i = 0; i < 4; i += 1) {
+      const byte = buf[pos + i]!;
+      const digit = byte >= 0x30 && byte <= 0x39 ? byte - 0x30 : byte >= 0x61 && byte <= 0x66 ? byte - 0x61 + 10 : -1;
+      if (digit === -1) {
+        valid = false;
+        break;
+      }
+      length = (length << 4) | digit;
+    }
+    if (!valid) throw new Error(`invalid pkt-line header ${JSON.stringify(buf.subarray(pos, pos + 4).toString('latin1'))}`);
     if (length === 0) return { lines, marker: 'flush', next: pos + 4 };
     if (length === 1) return { lines, marker: 'delim', next: pos + 4 };
     if (length === 2) return { lines, marker: 'end', next: pos + 4 };
@@ -1450,12 +1473,12 @@ function advertisementV0(repo: RepoRec, service: 'git-upload-pack' | 'git-receiv
   const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
   const symref = `symref=HEAD:${headTarget}`;
   if (refs.length === 0) {
-    parts.push(pktLine(Buffer.concat([Buffer.from(`${ZERO_OID} capabilities^{}\0${caps} ${symref}`, 'utf8')])));
+    parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps} ${symref}`));
   } else {
     let first = true;
     const pushLine = (oid: string, ref: string): void => {
       if (first) {
-        parts.push(pktLine(Buffer.concat([Buffer.from(`${oid} ${ref}\0${caps} ${symref}`, 'utf8')])));
+        parts.push(pktLine(`${oid} ${ref}\0${caps} ${symref}`));
         first = false;
       } else {
         parts.push(pktLine(`${oid} ${ref}\n`));
@@ -1469,7 +1492,7 @@ function advertisementV0(repo: RepoRec, service: 'git-upload-pack' | 'git-receiv
     }
     if (first) {
       // Refs exist but HEAD is unborn (default branch has no commit while others do).
-      parts.push(pktLine(Buffer.concat([Buffer.from(`${ZERO_OID} capabilities^{}\0${caps} ${symref}`, 'utf8')])));
+      parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps} ${symref}`));
     }
   }
   parts.push(PKT_FLUSH);
@@ -1623,32 +1646,37 @@ function fetchV2(repo: RepoRec, args: string[]): Buffer {
     return Buffer.concat([pktLine('acknowledgments\n'), ...ackLines.map((line) => pktLine(`${line}\n`)), PKT_FLUSH]);
   }
   const { pack, framedPack, shallowOut, unshallowOut } = fetchComputation(repo, request.wants, request.haves, request.shallow, request.depth, request.deepenRelative);
-  const sections: Buffer[] = [];
+  // Sections joined by DELIM packets and ended by one FLUSH, assembled as one flat parts
+  // list with a single final concat — the framed pack (the only large part) is copied once,
+  // not once per section join as the old section-by-section concat copied it.
+  const parts: Buffer[] = [];
+  let haveSection = false;
+  const beginSection = (): void => {
+    if (haveSection) parts.push(PKT_DELIM);
+    haveSection = true;
+  };
   if (request.haves.length > 0) {
+    beginSection();
     const lines = ackLines.length > 0 ? [...ackLines] : ['NAK'];
     lines.push('ready');
-    sections.push(Buffer.concat([pktLine('acknowledgments\n'), ...lines.map((line) => pktLine(`${line}\n`))]));
+    parts.push(pktLine('acknowledgments\n'), ...lines.map((line) => pktLine(`${line}\n`)));
   }
   if (shallowOut.length > 0 || unshallowOut.length > 0) {
-    const lines: string[] = [];
-    for (const oid of shallowOut) lines.push(`shallow ${oid}`);
-    for (const oid of unshallowOut) lines.push(`unshallow ${oid}`);
-    sections.push(Buffer.concat([pktLine('shallow-info\n'), ...lines.map((line) => pktLine(`${line}\n`))]));
+    beginSection();
+    parts.push(pktLine('shallow-info\n'));
+    for (const oid of shallowOut) parts.push(pktLine(`shallow ${oid}\n`));
+    for (const oid of unshallowOut) parts.push(pktLine(`unshallow ${oid}\n`));
   }
   // Once 'ready' is on the wire the client requires a packfile section to follow — even when
   // there is nothing to send (a no-op fetch or deepen), so an empty pack stands in for a null one.
   const effectivePack = pack ?? (request.done || request.depth !== null ? writePack([]) : null);
   if (effectivePack !== null) {
+    beginSection();
     // The cached computation's pack reuses its precomputed framing; only a synthetic
     // stand-in pack (empty fetch) is framed on the spot.
     const framed = effectivePack === pack && framedPack !== null ? framedPack : sidebandPack(effectivePack);
-    sections.push(Buffer.concat([pktLine('packfile\n'), framed]));
+    parts.push(pktLine('packfile\n'), framed);
   }
-  const parts: Buffer[] = [];
-  sections.forEach((section, index) => {
-    if (index > 0) parts.push(PKT_DELIM);
-    parts.push(section);
-  });
   parts.push(PKT_FLUSH);
   return Buffer.concat(parts);
 }
